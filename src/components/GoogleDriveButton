@@ -1,0 +1,94 @@
+import React, { useState } from 'react';
+import { Button } from '@/components/ui/button';
+import { Loader2 } from 'lucide-react';
+import { useToast } from '@/hooks/use-toast';
+import { authenticateGoogleDrive, openGoogleDrivePicker, downloadGoogleDriveFile } from '@/utils/googleDriveAuth';
+
+interface GoogleDriveButtonProps {
+  onFileSelect: (file: File) => void;
+  side: 'left' | 'right';
+}
+
+const GoogleDriveButton: React.FC<GoogleDriveButtonProps> = ({ onFileSelect, side }) => {
+  const [isLoading, setIsLoading] = useState(false);
+  const { toast } = useToast();
+
+  const handleGoogleDriveClick = async () => {
+    setIsLoading(true);
+    
+    try {
+      // Step 1: Authenticate with Google Drive
+      toast({
+        title: 'Connecting to Google Drive',
+        description: 'Please wait while we connect to your Google Drive account...'
+      });
+      
+      const accessToken = await authenticateGoogleDrive();
+      
+      // Step 2: Open file picker
+      toast({
+        title: 'Opening file picker',
+        description: 'Select a file from your Google Drive...'
+      });
+      
+      const selectedFile = await openGoogleDrivePicker();
+      
+      // Step 3: Download file content
+      toast({
+        title: 'Downloading file',
+        description: `Downloading ${selectedFile.name}...`
+      });
+      
+      const { content, metadata } = await downloadGoogleDriveFile(accessToken, selectedFile.id);
+      
+      // Step 4: Create File object
+      const blob = new Blob([content], { type: metadata.mimeType });
+      const file = new File([blob], metadata.name, { 
+        type: metadata.mimeType,
+        lastModified: Date.now()
+      });
+      
+      // Step 5: Pass file to parent component
+      onFileSelect(file);
+      
+      toast({
+        title: 'File imported successfully',
+        description: `${metadata.name} (${(parseInt(metadata.size || '0') / 1024).toFixed(1)} KB) has been imported from Google Drive.`
+      });
+      
+    } catch (error) {
+      console.error('Google Drive import error:', error);
+      toast({
+        title: 'Import failed',
+        description: 'Failed to import file from Google Drive. Please try again.',
+        variant: 'destructive'
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <Button
+      onClick={handleGoogleDriveClick}
+      disabled={isLoading}
+      variant="outline"
+      className="w-full mt-4 flex items-center justify-center space-x-2 hover:bg-blue-50 border-blue-200"
+    >
+      {isLoading ? (
+        <Loader2 className="w-4 h-4 animate-spin" />
+      ) : (
+        <img 
+          src="https://d64gsuwffb70l.cloudfront.net/6834112af136a2006c0fdf31_1748245981933_23e85925.png" 
+          alt="Google Drive" 
+          className="w-4 h-4"
+        />
+      )}
+      <span>
+        {isLoading ? 'Importing from Drive...' : 'Import from Google Drive'}
+      </span>
+    </Button>
+  );
+};
+
+export default GoogleDriveButton;
