@@ -1,4 +1,4 @@
-// Polyfill for Object.hasOwn (Node compatibility)
+// Polyfill for Object.hasOwn (Node 14 compatibility)
 if (typeof Object.hasOwn !== 'function') {
   Object.defineProperty(Object, 'hasOwn', {
     configurable: true,
@@ -8,89 +8,99 @@ if (typeof Object.hasOwn !== 'function') {
   });
 }
 
+// Require dependencies and initialize Express app
 const express = require('express');
 const app = express();
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
 const Diff = require('diff');
-const mammoth = require('mammoth');
-const Tesseract = require('tesseract.js');
-const fs = require('fs').promises;
+const mammoth = require('mammoth');           // For DOC/DOCX extraction
+const Tesseract = require('tesseract.js');     // For OCR on image files
+const fs = require('fs').promises;             // For reading/writing files
 const path = require('path');
-const nlp = require('compromise');
+const nlp = require('compromise');             // For semantic analysis
 const http = require('http').createServer(app);
 const io = require('socket.io')(http);
 
-// Serve static files from /public and parse URL-encoded bodies
+// Serve static files and parse form data
 app.use(express.static('public'));
 app.use(express.urlencoded({ extended: true }));
 
-// Multer config: uploads go to /uploads, 10 MB max each
-const upload = multer({ dest: 'uploads/', limits: { fileSize: 10 * 1024 * 1024 } });
+// Configure Multer with a 10 MB file‐size limit
+const upload = multer({ dest: 'uploads/', limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB
 
-// versions.json lives in project root alongside server.js
+// Path for version history storage
 const versionsFile = path.join(__dirname, 'versions.json');
 
-// ────────────────────────────────────────────────────────────────
-// Utility functions
-// ────────────────────────────────────────────────────────────────
+// — Utility Functions —
 
-function escapeHtml(s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// Escape HTML special characters in a string
+function escapeHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+// Returns true if the string is only whitespace (no visible characters)
 function isOnlyWhitespace(s) {
   return /^[ \t\r\n]+$/.test(s);
 }
 
+// Detect if text contains any Arabic‐script characters
 function containsArabic(s) {
   return /[\u0600-\u06FF]/.test(s);
 }
 
+// Count “tokens” (words) in a string. For Arabic, count each character instead.
 function countTokens(text) {
   if (!text) return 0;
   return containsArabic(text)
     ? text.replace(/\s+/g, '').length
-    : text.trim().split(/\s+/).filter(Boolean).length;
+    : text.trim().split(/\s+/).filter(t => t).length;
 }
 
-// Extract plain text from PDF, DOC/DOCX, TXT, and run OCR on images
+// Extract plain text from uploaded file (PDF, DOC/DOCX, TXT, or image‐OCR)
 async function extractText(file) {
   const ext = path.extname(file.originalname).slice(1).toLowerCase();
+
   try {
     if (ext === 'pdf') {
+      // Read PDF buffer, then parse
       const buf = await fs.readFile(file.path);
       return (await pdfParse(buf)).text;
     }
-    if (ext === 'doc' || ext === 'docx') {
+    else if (ext === 'doc' || ext === 'docx') {
+      // Use Mammoth to extract raw text from Word docs
       return (await mammoth.extractRawText({ path: file.path })).value;
     }
-    if (ext === 'txt') {
+    else if (ext === 'txt') {
+      // Plain‐text files: read directly
       return await fs.readFile(file.path, 'utf8');
     }
-    if (['jpg', 'jpeg', 'png'].includes(ext)) {
+    else if (['jpg','jpeg','png'].includes(ext)) {
+      // Run Tesseract OCR on image files
       const { data: { text } } = await Tesseract.recognize(file.path, 'eng');
       return text;
     }
+    // Unsupported extension => return empty
     return '';
   } catch (err) {
-    console.error('extractText error:', err);
+    console.error('✖ extractText error:', err);
     return '';
   } finally {
-    // Always delete the temp file when done
+    // Clean up the uploaded file from disk
     await fs.unlink(file.path).catch(() => {});
   }
 }
 
-// Estimate semantic “impact” using compromise (noun + verb count)
+// Compute a simple “semantic impact” (#nouns + #verbs) using compromise.js
 function semanticImpact(text) {
   const doc = nlp(text);
   return doc.nouns().length + doc.verbs().length;
 }
 
-// Ensure versions.json exists; returns parsed array
+// Load the versions.json file into memory (create an empty array if missing)
 async function loadVersions() {
   try {
+    // If versionsFile doesn't exist, create it with an empty array
     await fs.writeFile(versionsFile, JSON.stringify([], null, 2), { flag: 'wx' }).catch(() => {});
     return JSON.parse(await fs.readFile(versionsFile, 'utf8'));
   } catch {
@@ -105,155 +115,165 @@ async function saveVersion(v) {
   await fs.writeFile(versionsFile, JSON.stringify(arr, null, 2));
 }
 
-// Build an HTML diff (no closing </body></html> here; that's added downstream)
+// Generate side‐by‐side diff HTML for two text blobs (without closing </body></html>)
 function generateDiffHtml(text1, text2) {
+  // If the text contains Arabic, use diffChars; otherwise diffWordsWithSpace
   const parts = (containsArabic(text1) || containsArabic(text2))
     ? Diff.diffChars(text1, text2)
     : Diff.diffWordsWithSpace(text1, text2);
 
-  let leftCol = '', rightCol = '';
+  let left = '', right = '';
   const changes = [];
-  let insCount = 0, remCount = 0, sid = 0, num = 1;
+  let ins = 0, rem = 0, sid = 0, num = 1;
 
   parts.forEach(part => {
-    // Skip change spans containing only whitespace
-    if ((part.added || part.removed) && isOnlyWhitespace(part.value)) {
-      return;
-    }
+    // Skip diffs that are purely whitespace
+    if ((part.added || part.removed) && isOnlyWhitespace(part.value)) return;
 
     if (part.added) {
       sid++;
-      const tk = countTokens(part.value);
-      insCount += tk;
-      rightCol += `<span id="chg-${sid}" class="added">${escapeHtml(part.value)}</span>`;
+      ins += countTokens(part.value);
+      right += `<span id="chg-${sid}" class="added">${escapeHtml(part.value)}</span>`;
       changes.push({
         num: num++,
         type: 'INSERTED',
         txt: part.value.trim(),
-        cnt: tk,
+        cnt: countTokens(part.value),
         id: sid,
         impact: semanticImpact(part.value)
       });
-    } else if (part.removed) {
+    }
+    else if (part.removed) {
       sid++;
-      const tk = countTokens(part.value);
-      remCount += tk;
-      leftCol += `<span id="chg-${sid}" class="removed">${escapeHtml(part.value)}</span>`;
+      rem += countTokens(part.value);
+      left += `<span id="chg-${sid}" class="removed">${escapeHtml(part.value)}</span>`;
       changes.push({
         num: num++,
         type: 'REMOVED',
         txt: part.value.trim(),
-        cnt: tk,
+        cnt: countTokens(part.value),
         id: sid,
         impact: semanticImpact(part.value)
       });
-    } else {
-      leftCol += `<span class="unchanged">${escapeHtml(part.value)}</span>`;
-      rightCol += `<span class="unchanged">${escapeHtml(part.value)}</span>`;
+    }
+    else {
+      // Unchanged text
+      left += `<span class="unchanged">${escapeHtml(part.value)}</span>`;
+      right += `<span class="unchanged">${escapeHtml(part.value)}</span>`;
     }
   });
 
-  const summary = (insCount || remCount)
-    ? `Inserted ${insCount} token${insCount !== 1 ? 's' : ''}, Removed ${remCount} token${remCount !== 1 ? 's' : ''}.`
+  // Summary line (inserted/removed token counts)
+  const summary = (ins || rem)
+    ? `Inserted ${ins} token${ins !== 1 ? 's' : ''}, Removed ${rem} token${rem !== 1 ? 's' : ''}.`
     : 'No changes detected.';
 
+  // Build a “Changes” panel listing each diff chunk
   const changesHtml = changes.map(c => {
     const cls = c.type === 'INSERTED' ? 'ins' : 'rem';
     const sign = c.type === 'INSERTED' ? '+' : '-';
     return `
       <div class="chgblk ${cls}" onclick="scrollTo(${c.id})">
-        ${c.num}. ${c.type} (${sign}${c.cnt}, Impact: ${c.impact})<br>
-        "${escapeHtml(c.txt)}"
-      </div>`;
+        ${c.num}. ${c.type} (${sign}${c.cnt}, Impact: ${c.impact})<br>"${escapeHtml(c.txt)}"
+      </div>
+    `;
   }).join('');
 
+  // Return the HTML (without closing </body></html>). The client code appends buttons, etc. below.
   return `
-<!DOCTYPE html>
-<html>
-  <head>
-    <meta charset="UTF-8">
-    <title>Comparely Diff</title>
-    <style>
-      body { font-family: Arial; padding: 20px; }
-      .added { background: #e5f9e5; }
-      .removed { background: #fde2e2; }
-      .chgblk { margin: 10px 0; padding: 5px; border-radius: 4px; cursor: pointer; }
-      .cols { display: flex; gap: 10px; margin-top: 10px; }
-      .col { flex: 1; padding: 10px; border: 1px solid #ccc; white-space: pre-wrap; overflow: auto; max-height: 70vh; }
-      .unchanged { background: #fff; }
-    </style>
-  </head>
-  <body>
-    <h1>Comparely Diff</h1>
-    <div>Summary: ${summary}</div>
-    <div class="cols">
-      <div class="col">${leftCol}</div>
-      <div class="col">${rightCol}</div>
-    </div>
-    <h2>Changes</h2>
-    <div>${changesHtml}</div>
+<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Comparely Diff</title>
+  <style>
+    body { font-family: Arial; padding: 20px; }
+    .added { background: #e5f9e5; }
+    .removed { background: #fde2e2; }
+    .chgblk { margin: 10px 0; padding: 5px; border-radius: 4px; cursor: pointer; }
+    .cols { display: flex; gap: 10px; }
+    .col { flex: 1; padding: 10px; border: 1px solid #ccc; white-space: pre-wrap; overflow: auto; max-height: 70vh; }
+  </style>
+</head><body>
+  <h1>Comparely Diff</h1>
+  <div>Summary: ${summary}</div>
+  <div class="cols">
+    <div class="col">${left}</div>
+    <div class="col">${right}</div>
+  </div>
+  <h2>Changes</h2>
+  <div>${changesHtml}</div>
 `;
 }
 
-// ────────────────────────────────────────────────────────────────
-// Route: Compare two uploaded files (POST /compare)
-// ────────────────────────────────────────────────────────────────
+// —————————————————————————————————————————————————————————
+// Main “compare” route: accepts two files, extracts text, generates diff HTML, saves version
+// —————————————————————————————————————————————————————————
 app.post(
   '/compare',
-  upload.fields([{ name: 'file1' }, { name: 'file2' }]),
+  upload.fields([
+    { name: 'file1' },
+    { name: 'file2' }
+  ]),
   async (req, res) => {
     try {
+      // Validate both files are present
       if (!req.files?.file1?.[0] || !req.files?.file2?.[0]) {
         return res.status(400).send('Both files are required.');
       }
 
-      // Extract text in parallel
-      const [t1, t2] = await Promise.all([
-        extractText(req.files.file1[0]),
-        extractText(req.files.file2[0])
-      ]);
+      // Extract text from each upload
+      const t1 = await extractText(req.files.file1[0]);
+      const t2 = await extractText(req.files.file2[0]);
 
-      // Quick sanity checks
+      // Simple length checks
       if (t1.trim().length < 10 || t2.trim().length < 10) {
-        return res.send('Insufficient text to compare.');
+        return res.send('Insufficient text.');
       }
-      if (t1.length + t2.length > 500_000) {
+      if (t1.length + t2.length > 500000) {
         return res.status(413).send('Documents too large.');
       }
 
-      // Build diff HTML snippet
-      const htmlSnippet = generateDiffHtml(t1, t2);
+      // Generate the diff‐HTML snippet
+      const html = generateDiffHtml(t1, t2);
 
-      // Save version into versions.json
-      const versionId = Date.now();
-      await saveVersion({ id: versionId, ts: new Date().toISOString(), t1, t2 });
-
-      // Add collaboration invite UI at bottom
-      const inviteHtml = `
-    <div style="text-align:center; margin-top:20px;">
-      <input id="lnk" value="/collab/${versionId}" readonly style="width:60%; padding:5px;" />
-      <button id="cpy">Copy</button>
-      <button id="eml">Email</button>
-    </div>
-    <script>
-      document.getElementById('cpy')?.addEventListener('click', async () => {
-        const link = document.getElementById('lnk').value;
-        try { await navigator.clipboard.writeText(link); alert('Copied'); }
-        catch { alert('Copy failed'); }
+      // Save into version history
+      const vid = Date.now();
+      await saveVersion({
+        id: vid,
+        ts: new Date().toISOString(),
+        t1,
+        t2
       });
-      document.getElementById('eml')?.addEventListener('click', () => {
-        const recipient = prompt('Collaborator’s email:');
-        if (!recipient) return;
-        const subject = encodeURIComponent('Invitation to Collaborate');
-        const body = encodeURIComponent('Link: ' + document.getElementById('lnk').value);
-        window.location.href = 'mailto:' + recipient + '?subject=' + subject + '&body=' + body;
-      });
-    </script>
-  </body>
-</html>`;
 
-      // Send the combined diff+invite HTML back to client
-      res.send(htmlSnippet + inviteHtml);
+      // Append “invite” buttons/UI for real‐time collaboration
+      const withInv = html +
+        `<div style="text-align:center; margin-top:20px;">
+           <input id="lnk" value="https://comparely.glitch.me/collab/${vid}" readonly
+                  style="width:60%; padding:5px;" />
+           <button id="cpy">Copy</button>
+           <button id="eml">Email</button>
+         </div>
+         <script>
+           document.getElementById('cpy')?.addEventListener('click', async () => {
+             try {
+               await navigator.clipboard.writeText(
+                 document.getElementById('lnk').value
+               );
+               alert('Copied');
+             } catch {
+               alert('Copy failed');
+             }
+           });
+           document.getElementById('eml')?.addEventListener('click', () => {
+             const e = prompt('Collaborator\\'s email:');
+             if (!e) return;
+             const subj = encodeURIComponent('Invitation to Collaborate');
+             const body = encodeURIComponent(
+               'Link: ' + document.getElementById('lnk').value
+             );
+             window.location.href = 'mailto:' + e + '?subject=' + subj + '&body=' + body;
+           });
+         </script>
+       </body></html>`;
+
+      res.send(withInv);
     } catch (err) {
       console.error('Compare error:', err);
       res.status(500).send('Internal server error.');
@@ -261,19 +281,18 @@ app.post(
   }
 );
 
-// ────────────────────────────────────────────────────────────────
-// Socket.IO for real-time collaboration & comments
-// ────────────────────────────────────────────────────────────────
+// —————————————————————————————————————————————————————————
+// Socket.IO: Real‐time collaboration & commenting
+// —————————————————————————————————————————————————————————
 io.on('connection', socket => {
   socket.on('joinRoom', data => socket.join(data.roomId));
-  socket.on('collaborationUpdate', data => socket.to(data.roomId).emit('collaborationUpdate', data));
+  socket.on('collaborationUpdate', data =>
+    socket.to(data.roomId).emit('collaborationUpdate', data)
+  );
   socket.on('newComment', data => io.emit('broadcastComment', data));
 });
 
-// ────────────────────────────────────────────────────────────────
-// Start server (static + API) on specified PORT (default 3000)
-// ────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
-http.listen(PORT, () => {
-  console.log('Comparely listening on port', PORT);
+// Start the HTTP + WebSocket server
+http.listen(process.env.PORT || 3000, () => {
+  console.log('Comparely listening on port', http.address().port);
 });
