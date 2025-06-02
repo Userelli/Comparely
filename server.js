@@ -1,7 +1,7 @@
 import express from 'express';
 import multer from 'multer';
 import mammoth from 'mammoth';
-import pdfParse from 'pdf-parse';
+import pdfParse from "pdf-parse/lib/pdf-parse.js";
 import Tesseract from 'tesseract.js';
 import { diffWordsWithSpace } from 'diff';
 import fs from 'fs/promises';
